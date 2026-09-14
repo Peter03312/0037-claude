@@ -95,27 +95,35 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 			continue
 		}
 
-		msRaw := rec[colIndex[TimeColumn]]
-		msf, perr := strconv.ParseFloat(msRaw, 64)
+		// 同一行上的时间错误与压力列错误必须一并收集，不能因时间错误就
+		// 跳过压力列校验（否则检修员修复时间后还会再次撞上此前未报的错误）。
+		var (
+			ms         int64
+			timeOK     bool
+			parsed     = map[string]float64{}
+			pressureOK = true
+		)
+
+		msf, perr := strconv.ParseFloat(rec[colIndex[TimeColumn]], 64)
 		// 上限 1e15ms（约三万年）足以覆盖任何检修记录，同时杜绝 float->int64 溢出。
 		if perr != nil || !finite(msf) || msf != math.Trunc(msf) || msf < 0 || msf > 1e15 {
 			errs = append(errs, ErrorDetail{
 				Location: fmt.Sprintf("row %d, column %q", rn, TimeColumn),
 				Message:  "must be a non-negative integer number of milliseconds (<= 1e15)",
 			})
-			continue
-		}
-		ms := int64(msf)
-		if len(times) > 0 && ms <= times[len(times)-1] {
-			errs = append(errs, ErrorDetail{
-				Location: fmt.Sprintf("row %d, column %q", rn, TimeColumn),
-				Message:  fmt.Sprintf("time %d is not strictly greater than previous accepted time %d", ms, times[len(times)-1]),
-			})
-			continue
+		} else {
+			ms = int64(msf)
+			if len(times) > 0 && ms <= times[len(times)-1] {
+				errs = append(errs, ErrorDetail{
+					Location: fmt.Sprintf("row %d, column %q", rn, TimeColumn),
+					Message:  fmt.Sprintf("time %d is not strictly greater than previous accepted time %d", ms, times[len(times)-1]),
+				})
+			} else {
+				timeOK = true
+			}
 		}
 
-		parsed := map[string]float64{}
-		rowValid := true
+		// 无论时间是否合法，都继续校验本压力列，使该行的所有问题一次报全。
 		for _, name := range controlledColumns {
 			v, perr := strconv.ParseFloat(rec[colIndex[name]], 64)
 			if perr != nil {
@@ -123,7 +131,7 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 					Location: fmt.Sprintf("row %d, column %q", rn, name),
 					Message:  "cannot parse number: " + perr.Error(),
 				})
-				rowValid = false
+				pressureOK = false
 				continue
 			}
 			if !finite(v) {
@@ -131,18 +139,18 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 					Location: fmt.Sprintf("row %d, column %q", rn, name),
 					Message:  "must be a finite number",
 				})
-				rowValid = false
+				pressureOK = false
 				continue
 			}
 			parsed[name] = v
 		}
-		if !rowValid {
-			continue
-		}
 
-		times = append(times, ms)
-		for _, name := range controlledColumns {
-			values[name] = append(values[name], parsed[name])
+		// 只有该行时间与全部压力列都无错时才纳入数据集。
+		if timeOK && pressureOK {
+			times = append(times, ms)
+			for _, name := range controlledColumns {
+				values[name] = append(values[name], parsed[name])
+			}
 		}
 	}
 

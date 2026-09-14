@@ -2,7 +2,6 @@ package align
 
 import (
 	"fmt"
-	"math"
 )
 
 // BoundaryReport 是合格方案中单个阶段的可追溯验算明细。
@@ -160,10 +159,11 @@ func compareIntVec(a, b []int) int {
 }
 
 // scoreBetter 报告候选 (dev,node) 是否严格优于同右端的当前状态：
-// 偏差和更小；偏差和在容差内相等时结束边界向量字典序更小。
+// 先比精确的终值偏差和，更小者胜；只有偏差和完全相等（数学同值）时
+// 才退而取结束边界向量字典序更小者。这里不设任何容差，避免把存在真实
+// 微小偏差差异的两个方案当成并列而误选偏差更大的方案。
 func scoreBetter(dev float64, node *scoreNode, cur *scoreNode) bool {
-	eps := 1e-9 * math.Max(1, math.Abs(cur.dev))
-	if math.Abs(dev-cur.dev) > eps {
+	if dev != cur.dev {
 		return dev < cur.dev
 	}
 	return lexCompareScore(node, cur) < 0

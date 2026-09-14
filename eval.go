@@ -42,6 +42,13 @@ func buildPrefix(ds *Dataset, p PhaseSpec) prefix {
 	v := ds.Cols[p.ControlledColumn]
 	n := ds.NSamp
 	rev := make([]float64, n)
+	var sum, comp float64 // Kahan 补偿求和，避免累计量被浮点误差放大
+	add := func(x float64) {
+		y := x - comp
+		t := sum + y
+		comp = (t - sum) - y
+		sum = t
+	}
 	for i := 0; i+1 < n; i++ {
 		var d float64
 		switch p.Kind {
@@ -54,7 +61,8 @@ func buildPrefix(ds *Dataset, p PhaseSpec) prefix {
 				d = v[i+1] - v[i]
 			}
 		}
-		rev[i+1] = rev[i] + d
+		add(d)
+		rev[i+1] = sum
 	}
 	return prefix{reverse: rev}
 }
@@ -84,19 +92,19 @@ func quickEval(ds *Dataset, p PhaseSpec, pf prefix, s, e int, single, total floa
 		ev.Violations = append(ev.Violations, ViolDuration)
 	}
 	ev.FinalDeviation = math.Abs(v[e] - p.TargetFinal)
-	if gt(ev.FinalDeviation, p.AbsTolerance) {
+	if ev.FinalDeviation > p.AbsTolerance {
 		ev.Violations = append(ev.Violations, ViolFinalValue)
 	}
 	if p.Kind != KindHolding {
 		ev.ReverseCumulative = pf.reverse[e] - pf.reverse[s]
-		if gt(ev.ReverseCumulative, p.AllowedReverseCum) {
+		if ev.ReverseCumulative > p.AllowedReverseCum {
 			ev.Violations = append(ev.Violations, ViolReverseCum)
 		}
 	} else {
-		if gt(single, float64(p.MaxSingleExcursionMS)) {
+		if single > float64(p.MaxSingleExcursionMS) {
 			ev.Violations = append(ev.Violations, ViolSingleExcurs)
 		}
-		if gt(total, float64(p.MaxTotalExcursionMS)) {
+		if total > float64(p.MaxTotalExcursionMS) {
 			ev.Violations = append(ev.Violations, ViolTotalExcurs)
 		}
 	}
@@ -104,11 +112,8 @@ func quickEval(ds *Dataset, p PhaseSpec, pf prefix, s, e int, single, total floa
 	return ev
 }
 
-// gt 是带相对容差的大于比较：落在预算上（闭区间语义）不算超限。
-func gt(x, limit float64) bool {
-	eps := 1e-9 * math.Max(1, math.Abs(limit))
-	return x > limit+eps
-}
+// 比较一律采用严格数学语义：恰好等于上限为合格（闭区间），超出任意小量即不合格。
+// 不施加任何工程容差去“放宽”规格；反向累计量改用 Kahan 补偿求和控制计算误差。
 
 // evaluate 评估任意区段（诊断路径下的违规区间也用它）。
 func evaluate(ds *Dataset, p PhaseSpec, s, e int) Eval {
@@ -219,30 +224,64 @@ func growHold(ds *Dataset, p PhaseSpec, st holdState, i int) holdState {
 }
 
 // segmentExcursions 返回线性段 [t0,t1]（端点压力 y0,y1）内压力严格位于闭带
-// [lo,hi] 之外的时间子区间（浮点毫秒）。闭带边界上的点不算越带。
-// 线性函数与带相交最多两次：穿越后的状态由穿越方向唯一确定
-// （上穿下界=进入带内，上穿上界=穿出带外；下穿反之），
-// 从而正确处理“端点在界内/界上、交点后穿出”等全部情形。
+// [lo,hi] 之外的时间子区间（浮点毫秒）。闭带边界上的单个点不算越带，
+// 但“从界点出发向外偏离”的整段必须计入。
+//
+// 关键：每个事件点的状态取越过该点之后的单侧极限，而不是该点本身的状态
+// （界点本身按闭带语义算“在带内”，会吞掉随后整段的越带）。
+//   - 段首 t0 取右侧极限（沿 y0→y1 方向微移后的状态）；
+//   - 段尾 t1 取左侧极限（沿 y1→y0 方向微移后的状态）；
+//   - 内部交点取穿越方向决定的穿越后状态
+//     （上穿下界=进入带内，上穿上界=穿出带外；下穿反之）。
 func segmentExcursions(t0, t1, y0, y1, lo, hi float64) [][2]float64 {
-	inAt := func(y float64) bool { return y >= lo && y <= hi }
+	// rightOutside：从 (t0,y0) 出发、向 y1 移动一个无穷小量后是否处于带外。
+	// 解决“恰在界点上并向外偏离”被漏报的问题。
+	rightOutside := func() bool {
+		switch {
+		case y0 < lo || y0 > hi:
+			return true // 已在带外
+		case y0 > lo && y0 < hi:
+			return false // 严格带内
+		}
+		// y0 恰在界点上：看运动方向把它带到带内还是带外。
+		if y0 == lo {
+			return y1 < y0 // 在下界，向下走即出带
+		}
+		return y1 > y0 // 在上界，向上走即出带
+	}
+	// leftOutside：从 (t1,y1) 反向、向 y0 移动一个无穷小量后是否处于带外。
+	leftOutside := func() bool {
+		switch {
+		case y1 < lo || y1 > hi:
+			return true
+		case y1 > lo && y1 < hi:
+			return false
+		}
+		// y1 恰在界点上：它“之前”是否带外，取决于 y0→y1 是从外侧抵达该界点。
+		if y1 == lo {
+			return y0 < y1 // 从下界下方抵达
+		}
+		return y0 > y1 // 从上界上方抵达
+	}
 
 	type pt struct {
 		t   float64
-		out bool // 越过该点后是否处于带外
+		out bool // 该点之后（右侧）是否处于带外
 	}
-	pts := []pt{{t0, !inAt(y0)}}
+	pts := []pt{{t0, rightOutside()}}
 
 	if y0 != y1 {
-		// 与下界 lo 的交点：下穿后带外，上穿后带内。
+		// 与下界 lo 的内部交点：下穿后带外，上穿后带内。
 		if tL, ok := crossingTime(t0, t1, y0, y1, lo); ok {
 			pts = append(pts, pt{tL, y1 < y0})
 		}
-		// 与上界 hi 的交点：上穿后带外，下穿后带内。
+		// 与上界 hi 的内部交点：上穿后带外，下穿后带内。
 		if tH, ok := crossingTime(t0, t1, y0, y1, hi); ok {
 			pts = append(pts, pt{tH, y1 > y0})
 		}
 	}
-	pts = append(pts, pt{t1, !inAt(y1)})
+	// 段尾事件携带的是“其左侧区间”的状态，故用左极限；它只决定最后一个区间。
+	pts = append(pts, pt{t1, leftOutside()})
 
 	// 按时刻排序（交点至多两个，简单插入排序）。
 	for a := 1; a < len(pts); a++ {
@@ -250,7 +289,7 @@ func segmentExcursions(t0, t1, y0, y1, lo, hi float64) [][2]float64 {
 			pts[b], pts[b-1] = pts[b-1], pts[b]
 		}
 	}
-	// 去重：同一时刻两个交点（退化情形）时，穿越净效果为带内。
+	// 去重：同一时刻两个事件（lo==hi 退化带等）净效果为带内。
 	uniq := pts[:0]
 	for _, q := range pts {
 		if n := len(uniq); n > 0 && uniq[n-1].t == q.t {

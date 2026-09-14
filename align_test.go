@@ -2,6 +2,7 @@ package align
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -471,5 +472,219 @@ func TestReverseCumulative(t *testing.T) {
 	ev2 := evaluate(ds2, rel, 0, 3)
 	if !approxEq(ev2.ReverseCumulative, 2, 1e-9) {
 		t.Fatalf("release reverse cumulative = %v, want 2", ev2.ReverseCumulative)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7) 回归：保压压力恰从允许带边缘向外偏离，越带时间必须被计入，不得漏报。
+// ---------------------------------------------------------------------------
+
+func TestExcursionFromExactBandEdge(t *testing.T) {
+	p := PhaseSpec{Kind: KindHolding, ControlledColumn: ColTrainPipe,
+		TargetFinal: 100, HoldingBandHalfWidth: 5} // 带 [95,105]
+
+	// 段首恰在上界 105，随后向上偏离到 110：除起点这个零宽界点外整段都带外，
+	// 旧实现把段首状态按“界上=带内”处理，会漏掉整段越带。
+	outs := segmentExcursions(0, 100, 105, 110, 95, 105)
+	if len(outs) != 1 {
+		t.Fatalf("edge->above: want one excursion [0,100], got %v", outs)
+	}
+	if !approxEq(outs[0][0], 0, 1e-9) || !approxEq(outs[0][1], 100, 1e-9) {
+		t.Fatalf("edge->above excursion = %v, want [0 100]", outs[0])
+	}
+
+	// 段首恰在下界 95，随后向下偏离到 90：同样整段带外。
+	outs2 := segmentExcursions(0, 100, 95, 90, 95, 105)
+	if len(outs2) != 1 || !approxEq(outs2[0][0], 0, 1e-9) || !approxEq(outs2[0][1], 100, 1e-9) {
+		t.Fatalf("edge->below excursion = %v, want [0 100]", outs2)
+	}
+
+	// 反向必须仍然不算越带：段首在界点、随后回到带内（105 -> 100）无越带时长。
+	if outs3 := segmentExcursions(0, 100, 105, 100, 95, 105); len(outs3) != 0 {
+		t.Fatalf("edge->inside must have no excursion, got %v", outs3)
+	}
+	// 段尾恰在界点、之前整段带外（110 -> 105）：越带 [0,100]，界点本身零宽不扣减。
+	outs4 := segmentExcursions(0, 100, 110, 105, 95, 105)
+	if len(outs4) != 1 || !approxEq(outs4[0][0], 0, 1e-9) || !approxEq(outs4[0][1], 100, 1e-9) {
+		t.Fatalf("above->edge excursion = %v, want [0 100]", outs4)
+	}
+
+	// 端到端：样本点恰在界点、之后一直向外，单次越带就是整段 200ms，
+	// 预算 100ms 时必须判不合格（旧实现漏报会误判合格）。
+	ds := mkDataset([]int64{0, 100, 200}, []float64{105, 108, 110}, constVals(3, 0))
+	hp := p
+	hp.Duration = ClosedInterval{Min: 200, Max: 200}
+	hp.AbsTolerance = 200
+	hp.MaxSingleExcursionMS = 100
+	hp.MaxTotalExcursionMS = 100
+	hp.MaxSampleGapMS = 1000
+	if ev := evaluate(ds, hp, 0, 2); ev.Valid {
+		t.Fatalf("200ms excursion from exact edge must fail 100ms budget, got valid %+v", ev)
+	}
+	// 预算恰好 200ms 时合格，且报告的越带时长为精确的 200ms（不放宽也不漏报）。
+	hp.MaxSingleExcursionMS = 200
+	hp.MaxTotalExcursionMS = 200
+	evOK := evaluate(ds, hp, 0, 2)
+	if !evOK.Valid {
+		t.Fatalf("200ms excursion at exact 200ms budget must be valid, got %v", evOK.Violations)
+	}
+	if !approxEq(evOK.SingleExcursionMS, 200, 1e-9) || !approxEq(evOK.TotalExcursionMS, 200, 1e-9) {
+		t.Fatalf("excursion metrics = %v/%v, want 200/200", evOK.SingleExcursionMS, evOK.TotalExcursionMS)
+	}
+}
+
+// 跨样本点从界点向外偏离也必须连续计入，不能在界点处被错误闭合。
+func TestExcursionFromEdgeAcrossSamples(t *testing.T) {
+	p := PhaseSpec{Kind: KindHolding, ControlledColumn: ColTrainPipe,
+		TargetFinal: 100, HoldingBandHalfWidth: 5} // 带 [95,105]
+	// 110(带外) -> 105(恰在上界) -> 110(再向上)。
+	// 中间样本只是越过界点的零宽接触，两侧越带应合并为一次连续 200ms。
+	ds := mkDataset([]int64{0, 100, 200}, []float64{110, 105, 110}, constVals(3, 0))
+	m := computeHoldMetrics(ds, p, 0, 2)
+	if !approxEq(m.single, 200, 1e-9) || !approxEq(m.total, 200, 1e-9) {
+		t.Fatalf("across-edge single/total = %v/%v, want merged 200/200", m.single, m.total)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8) 回归：终值只超出上限一个极小数值也必须判不合格，系统不得擅自放宽标准。
+// ---------------------------------------------------------------------------
+
+func TestFinalValueNoToleranceRelaxation(t *testing.T) {
+	rel := PhaseSpec{Kind: KindRelease, ControlledColumn: ColTrainPipe,
+		Duration: ClosedInterval{Min: 100, Max: 100}, TargetFinal: 100,
+		AllowedReverseCum: 10, MaxSampleGapMS: 200}
+
+	// 容差为 0：终值超出 5e-10 也必须不合格（旧实现的绝对 epsilon=1e-9 会放行）。
+	rel0 := rel
+	rel0.AbsTolerance = 0
+	ds := mkDataset([]int64{0, 100}, []float64{100, 100.0000000005}, constVals(2, 0))
+	if ev := evaluate(ds, rel0, 0, 1); ev.Valid {
+		t.Fatalf("final value 5e-10 over a zero tolerance must be rejected")
+	}
+	// 恰好等于目标必须合格。
+	ds2 := mkDataset([]int64{0, 100}, []float64{100, 100}, constVals(2, 0))
+	if ev2 := evaluate(ds2, rel0, 0, 1); !ev2.Valid {
+		t.Fatalf("final value exactly on target must be valid, got %v", ev2.Violations)
+	}
+
+	// 有限容差 1：超出 1 仅 5e-10 也必须不合格。旧实现 eps=1e-9*max(1,tol)=1e-9，
+	// 会把 5e-10 这个真实超限吞掉而擅自放行合格。
+	rel1 := rel
+	rel1.AbsTolerance = 1
+	ds3 := mkDataset([]int64{0, 100}, []float64{100, 101.0000000005}, constVals(2, 0))
+	if ev3 := evaluate(ds3, rel1, 0, 1); ev3.Valid {
+		t.Fatalf("final value 5e-10 beyond tolerance must be rejected")
+	}
+	// 恰好落在容差边界（偏差恰为 1）合格。
+	ds4 := mkDataset([]int64{0, 100}, []float64{100, 101}, constVals(2, 0))
+	if ev4 := evaluate(ds4, rel1, 0, 1); !ev4.Valid {
+		t.Fatalf("final deviation exactly at tolerance boundary must be valid, got %v", ev4.Violations)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 9) 回归：多个合格切分必须选“终值偏差和最小”者，而不是被字典序抢先。
+// ---------------------------------------------------------------------------
+
+func TestAlignPicksMinimumDeviationNotLex(t *testing.T) {
+	// 两段：充气在 e=1 与 e=2 均合法，缓解均可收尾到 e=4。
+	//   [1,4]: 充气终值偏差 |60-70|=10，缓解终值偏差 |50-50|=0，偏差和 10；
+	//   [2,4]: 充气终值偏差 |70-70|=0，缓解终值偏差 0，偏差和 0。
+	// 字典序更偏向 [1,4]，但偏差和更小的是 [2,4]，必须选 [2,4]。
+	times := uniformTimes(5, 100)
+	tp := []float64{50, 60, 70, 60, 50}
+	ds := mkDataset(times, tp, constVals(5, 0))
+	spec := mustSpec(t, `{
+	  "phases": [
+	    {"kind":"charging","controlled_column":"train_pipe","duration_ms":{"min_ms":100,"max_ms":200},
+	     "target_final":70,"abs_tolerance":20,"allowed_reverse_cumulative":0,
+	     "max_sample_gap_ms":200},
+	    {"kind":"release","controlled_column":"train_pipe","duration_ms":{"min_ms":200,"max_ms":300},
+	     "target_final":50,"abs_tolerance":20,"allowed_reverse_cumulative":20,
+	     "max_sample_gap_ms":200}
+	  ]}`)
+	res := Align(ds, spec)
+	if res.Verdict != "qualified" {
+		t.Fatalf("want qualified, got %+v", res.Diagnosis)
+	}
+	if got := res.EndBoundaryVector; len(got) != 2 || got[0] != 2 || got[1] != 4 {
+		t.Fatalf("must choose min-deviation [2 4] over lex-smaller [1 4], got %v", got)
+	}
+	if !approxEq(res.TotalFinalDeviation, 0, 1e-12) {
+		t.Fatalf("total deviation = %v, want 0", res.TotalFinalDeviation)
+	}
+}
+
+// 偏差和极小差异也必须被识别（旧实现的相对容差会把它们当并列）。
+func TestAlignDistinguishesTinyDeviationDifference(t *testing.T) {
+	times := uniformTimes(4, 100)
+	// 充气 e=1 终值偏差 1e-10，e=2 终值偏差 0；缓解都到 e=3 且终值偏差 0。
+	tp := []float64{100, 100 + 1e-10, 100, 100}
+	ds := mkDataset(times, tp, constVals(4, 0))
+	spec := mustSpec(t, `{
+	  "phases": [
+	    {"kind":"charging","controlled_column":"train_pipe","duration_ms":{"min_ms":100,"max_ms":200},
+	     "target_final":100,"abs_tolerance":1,"allowed_reverse_cumulative":1,
+	     "max_sample_gap_ms":200},
+	    {"kind":"release","controlled_column":"train_pipe","duration_ms":{"min_ms":100,"max_ms":200},
+	     "target_final":100,"abs_tolerance":1,"allowed_reverse_cumulative":1,
+	     "max_sample_gap_ms":200}
+	  ]}`)
+	res := Align(ds, spec)
+	if res.Verdict != "qualified" {
+		t.Fatalf("want qualified, got %+v", res.Diagnosis)
+	}
+	// e=2 偏差和 0 更小（虽然 e=1 字典序更小且差仅 1e-10），必须选 [2,3]。
+	if got := res.EndBoundaryVector; got[0] != 2 {
+		t.Fatalf("tiny deviation difference must be honored, got vector %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10) 回归：同一行同时有时间错误和压力错误时必须一次全部报出。
+// ---------------------------------------------------------------------------
+
+func TestCSVReportsTimeAndPressureErrorsOnSameRow(t *testing.T) {
+	// 第 3 行：时间非整数（错）+ train_pipe 为 NaN（错），两者都必须出现。
+	csvText := "ms,train_pipe,brake_cylinder\n" +
+		"0,500,300\n" +
+		"100,510,300\n" +
+		"150.5,NaN,300\n" +
+		"200,530,300\n"
+	_, errs := ParseCSV(strings.NewReader(csvText))
+	var sawTime, sawPressure bool
+	for _, e := range errs {
+		if strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, `"ms"`) {
+			sawTime = true
+		}
+		if strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, ColTrainPipe) {
+			sawPressure = true
+		}
+	}
+	if !sawTime || !sawPressure {
+		t.Fatalf("row 4 must report both time and pressure errors, got %+v (time=%v pressure=%v)",
+			errs, sawTime, sawPressure)
+	}
+}
+
+func TestCSVReportsNonIncreasingTimeAndBadPressureTogether(t *testing.T) {
+	// 第 3 行：时间回退（<= 上一已接受时间）+ brake_cylinder 非有限，必须同报。
+	csvText := "ms,train_pipe,brake_cylinder\n" +
+		"0,500,300\n" +
+		"100,510,300\n" +
+		"100,520,+Inf\n"
+	_, errs := ParseCSV(strings.NewReader(csvText))
+	var sawTime, sawPressure bool
+	for _, e := range errs {
+		if strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, `"ms"`) {
+			sawTime = true
+		}
+		if strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, ColBrakeCylinder) {
+			sawPressure = true
+		}
+	}
+	if !sawTime || !sawPressure {
+		t.Fatalf("non-increasing time and non-finite pressure on row 4 must both be reported, got %+v", errs)
 	}
 }
