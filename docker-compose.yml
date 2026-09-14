@@ -1,0 +1,32 @@
+# 制动分配阀整周期验算服务编排。
+#   - api：常驻验算 HTTP 服务；
+#   - verify：一次性服务，执行 go test 全套单测与 HTTP 冒烟，成功后退出。
+#
+# 宿主映射端口可用 API_PORT 覆盖，例如：API_PORT=9090 docker compose up verify
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+    ports:
+      # 宿主 ${API_PORT:-8080} -> 容器 8080，映射可通过环境变量修改。
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      SMOKE_URL: "http://api:8080"
+    restart: "no"

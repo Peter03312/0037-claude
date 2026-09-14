@@ -1,0 +1,16 @@
+# Binaries and build output
+/brakealign
+/cmd/smoke/smoke
+*.test
+*.out
+
+# Test artifacts
+coverage.html
+
+# Local environment overrides
+.env
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store

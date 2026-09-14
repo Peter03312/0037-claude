@@ -1,0 +1,10 @@
+# verify 一次性服务：运行单元测试与端到端 HTTP 冒烟后退出。
+# 与 Dockerfile 的构建阶段一致，使用 golang:1.24 工具链运行 go test。
+FROM golang:1.24-alpine
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+COPY . .
+# 先跑全部单元测试（含共享边界、插值越带、局部贪心失败、采样断口等覆盖），
+# 再对 api 服务做真实 HTTP 冒烟；任一失败即非零退出。
+CMD ["sh", "-c", "set -e; go test -v ./...; go run ./cmd/smoke -url http://api:8080"]

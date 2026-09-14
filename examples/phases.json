@@ -1,0 +1,33 @@
+{
+  "phases": [
+    {
+      "kind": "charging",
+      "controlled_column": "train_pipe",
+      "duration_ms": {"min_ms": 200, "max_ms": 200},
+      "target_final": 110,
+      "abs_tolerance": 1,
+      "allowed_reverse_cumulative": 0,
+      "max_sample_gap_ms": 200
+    },
+    {
+      "kind": "holding",
+      "controlled_column": "train_pipe",
+      "duration_ms": {"min_ms": 200, "max_ms": 200},
+      "target_final": 100,
+      "abs_tolerance": 5,
+      "holding_band_half_width": 5,
+      "max_single_out_of_band_ms": 50,
+      "max_total_out_of_band_ms": 50,
+      "max_sample_gap_ms": 200
+    },
+    {
+      "kind": "release",
+      "controlled_column": "train_pipe",
+      "duration_ms": {"min_ms": 400, "max_ms": 400},
+      "target_final": 40,
+      "abs_tolerance": 1,
+      "allowed_reverse_cumulative": 0,
+      "max_sample_gap_ms": 200
+    }
+  ]
+}
