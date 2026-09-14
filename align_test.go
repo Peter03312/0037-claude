@@ -688,3 +688,91 @@ func TestCSVReportsNonIncreasingTimeAndBadPressureTogether(t *testing.T) {
 		t.Fatalf("non-increasing time and non-finite pressure on row 4 must both be reported, got %+v", errs)
 	}
 }
+
+// 一行压力非法、后一行时间相对“原始前一行”回退时，两个问题必须在同一单里报出，
+// 不能因为非法行被拒绝、时间基准停在更早的已接受行上而掩盖后一行的回退。
+func TestCSVRegressionAfterInvalidPressureRow(t *testing.T) {
+	csvText := "ms,train_pipe,brake_cylinder\n" +
+		"0,500,300\n" + // row2 正常，已接受基准 0
+		"100,NaN,300\n" + // row3 压力非法：该行被拒绝；但其时间 100 仍是下一行的比较基准
+		"50,520,300\n" // row4 时间 50 相对原始前一行 100 回退，必须在首单就报出
+	_, errs := ParseCSV(strings.NewReader(csvText))
+
+	var sawBadPressureRow3, sawRegressionRow4 bool
+	for _, e := range errs {
+		if strings.Contains(e.Location, "row 3") && strings.Contains(e.Location, ColTrainPipe) {
+			sawBadPressureRow3 = true
+		}
+		if strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, `"ms"`) {
+			sawRegressionRow4 = true
+		}
+	}
+	if !sawBadPressureRow3 {
+		t.Fatalf("row 3 non-finite pressure must be reported, got %+v", errs)
+	}
+	if !sawRegressionRow4 {
+		t.Fatalf("row 4 time regression (50 < preceding raw time 100) must be reported in the same order "+
+			"even though row 3 was rejected for bad pressure, got %+v", errs)
+	}
+}
+
+// 若压力非法行自身的时间也无法解析，则它无法提供基准，后一行应相对更前面的
+// 最近一个“可解析时间”比较，且该行自身的时间错误也要报。
+func TestCSVRegressionAfterUnparseableTimeRow(t *testing.T) {
+	csvText := "ms,train_pipe,brake_cylinder\n" +
+		"0,500,300\n" + // row2
+		"oops,NaN,300\n" + // row3 时间无法解析且压力非法：两个都报，不产生时间基准
+		"50,520,300\n" // row4 时间 50 相对最近可解析时间 0 仍是递增，故 row4 不应报回退
+	_, errs := ParseCSV(strings.NewReader(csvText))
+
+	var sawRow3Time, sawRow3Pressure, sawRow4Time bool
+	for _, e := range errs {
+		switch {
+		case strings.Contains(e.Location, "row 3") && strings.Contains(e.Location, `"ms"`):
+			sawRow3Time = true
+		case strings.Contains(e.Location, "row 3") && strings.Contains(e.Location, ColTrainPipe):
+			sawRow3Pressure = true
+		case strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, `"ms"`):
+			sawRow4Time = true
+		}
+	}
+	if !sawRow3Time || !sawRow3Pressure {
+		t.Fatalf("row 3 must report both unparseable time and bad pressure, got %+v", errs)
+	}
+	if sawRow4Time {
+		t.Fatalf("row 4 time 50 is increasing vs last parseable time 0; must not report regression, got %+v", errs)
+	}
+}
+
+// 回退行被拒绝后，后一行虽相对原始前一行回升、却仍小于更早已接受值：整单必拒，
+// 且一旦没有其它错误，被接受的时间序列仍必须严格递增（覆盖 greaterThanAccepted 把关）。
+func TestCSVDatasetTimesRemainIncreasing(t *testing.T) {
+	// 0(接受) -> 100(回退被拒) -> 50(相对100递增但小于更早的已接受值，不应纳入)。
+	// 0,200 被接受 -> 100 回退被拒 -> 150 相对原始前一行 100 回升、数据正常，
+	// 但 150 仍小于最后一个已接受时间 200，故不应纳入数据集（保证 times 严格递增）。
+	ds, errs := ParseCSV(strings.NewReader(
+		"ms,train_pipe,brake_cylinder\n" +
+			"0,500,300\n" + // row2：接受 0
+			"200,510,300\n" + // row3：接受 200
+			"100,410,300\n" + // row4：相对 200 回退，报错并拒绝
+			"150,420,300\n")) // row5：相对原始前一行 100 递增，但 < 已接受的 200
+	var sawRow4Regression, sawRow5Time bool
+	for _, e := range errs {
+		switch {
+		case strings.Contains(e.Location, "row 4") && strings.Contains(e.Location, `"ms"`):
+			sawRow4Regression = true
+		case strings.Contains(e.Location, "row 5") && strings.Contains(e.Location, `"ms"`):
+			sawRow5Time = true
+		}
+	}
+	if !sawRow4Regression {
+		t.Fatalf("row 4 regression must be reported, got %+v", errs)
+	}
+	if sawRow5Time {
+		t.Fatalf("row 5 time 150 is increasing vs preceding raw 100; no time error, got %+v", errs)
+	}
+	// 整单有错误，返回 nil；不会返回一个非递增的数据集。
+	if ds != nil {
+		t.Fatalf("order with a regression must be rejected, got dataset: %v", ds.Times)
+	}
+}

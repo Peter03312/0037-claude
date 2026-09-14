@@ -66,6 +66,15 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 		ColBrakeCylinder: {},
 	}
 
+	// lastRaw 是“原始前一行”的时间戳，与该行是否被纳入数据集无关。
+	// 时间递增校验逐行比较相邻原始行，而不是只比较已接受行：否则某行因压力非法
+	// 被整行拒绝后，其后一行相对这行的时间回退会被掩盖，检修员需先修好压力
+	// 才能在再次提交时看到回退错误，被迫多次修单。
+	var (
+		lastRaw    int64
+		hasLastRaw bool
+	)
+
 	recordIdx := 0
 	for {
 		rec, err := cr.Read()
@@ -111,16 +120,20 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 				Location: fmt.Sprintf("row %d, column %q", rn, TimeColumn),
 				Message:  "must be a non-negative integer number of milliseconds (<= 1e15)",
 			})
+			// 无法解析的时间不能作为下一行的递增基准，lastRaw 保持不变。
 		} else {
 			ms = int64(msf)
-			if len(times) > 0 && ms <= times[len(times)-1] {
+			if hasLastRaw && ms <= lastRaw {
 				errs = append(errs, ErrorDetail{
 					Location: fmt.Sprintf("row %d, column %q", rn, TimeColumn),
-					Message:  fmt.Sprintf("time %d is not strictly greater than previous accepted time %d", ms, times[len(times)-1]),
+					Message:  fmt.Sprintf("time %d is not strictly greater than the preceding row's time %d", ms, lastRaw),
 				})
 			} else {
 				timeOK = true
 			}
+			// 无论该行压力是否合法、自身是否回退，都更新原始时间基准，
+			// 使下一行与本行（而不是更早的已接受行）比较递增性。
+			lastRaw, hasLastRaw = ms, true
 		}
 
 		// 无论时间是否合法，都继续校验本压力列，使该行的所有问题一次报全。
@@ -146,7 +159,11 @@ func ParseCSV(r io.Reader) (*Dataset, []ErrorDetail) {
 		}
 
 		// 只有该行时间与全部压力列都无错时才纳入数据集。
-		if timeOK && pressureOK {
+		// 额外保证纳入序列相对“最后一个已接受样本”也严格递增：当前面有回退行被
+		// 拒绝时，后续行可能相对原始前一行递增、却仍小于更早被接受的时间。
+		// 这种情况下整单本就已因回退错误而拒收，这里只是保持 times 不变量。
+		greaterThanAccepted := len(times) == 0 || ms > times[len(times)-1]
+		if timeOK && pressureOK && greaterThanAccepted {
 			times = append(times, ms)
 			for _, name := range controlledColumns {
 				values[name] = append(values[name], parsed[name])
